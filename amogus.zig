@@ -61,6 +61,7 @@ fn amogusNormalized() [amogus.len][amogus[0].len]f32
 
 inline fn processFrame(comptime S: type, comptime T: type, width: usize, height: usize, offset: f32, factor: f32, depth: u6, dither: bool, src_stride2: usize, dst_stride2: usize, srcp2: [*]const u8, dstp2: [*]u8) void
 {
+    @setFloatMode(.Optimized);  // Allows the compiler to add fused multiply-add instructions
     const amogus_f = comptime amogusNormalized();
 
     const src_stride = src_stride2 / @sizeOf(S);
