@@ -81,7 +81,7 @@ inline fn processFrame(comptime S: type, comptime T: type, width: usize, height:
             }
 
             if (T != f32) {
-                p = @minimum(@maximum(p, 0.0), @intToFloat(f32, @intCast(u64, 1) << depth) - 1);
+                p = @minimum(@maximum(p, 0.0), @intToFloat(f32, @as(u64, 1) << depth) - 1);
             }
 
             dstp[j] = if (T != f32) @floatToInt(T, @round(p)) else p;
@@ -95,16 +95,16 @@ inline fn processFrame(comptime S: type, comptime T: type, width: usize, height:
 inline fn setOffsetMax(depth: u6, fullrange: bool, plane: c_int, color_family: c.VSColorFamily, offset: *f32, max: *f32) void
 {
     if (plane != 0 and color_family != c.cfRGB) {
-        offset.* = @intToFloat(f32, @intCast(u64, 1) << (depth - 1));
+        offset.* = @intToFloat(f32, @as(u64, 1) << (depth - 1));
     }
-    max.* = @intToFloat(f32, (@intCast(u64, 1) << depth) - 1);
+    max.* = @intToFloat(f32, (@as(u64, 1) << depth) - 1);
     if (!fullrange) {
         if (plane != 0 and color_family != c.cfRGB) {
-            offset.* = @intToFloat(f32, @intCast(u64, 1) << (depth - 1));
-            max.* = @intToFloat(f32, @intCast(u64, 224) << (depth - 8));
+            offset.* = @intToFloat(f32, @as(u64, 1) << (depth - 1));
+            max.* = @intToFloat(f32, @as(u64, 224) << (depth - 8));
         } else {
-            offset.* = @intToFloat(f32, @intCast(u64, 16) << (depth - 8));
-            max.* = @intToFloat(f32, @intCast(u64, 219) << (depth - 8));
+            offset.* = @intToFloat(f32, @as(u64, 16) << (depth - 8));
+            max.* = @intToFloat(f32, @as(u64, 219) << (depth - 8));
         }
     }
 }
