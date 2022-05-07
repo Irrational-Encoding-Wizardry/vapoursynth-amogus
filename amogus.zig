@@ -6,6 +6,7 @@ const c = @cImport({
 
 const std = @import("std");
 const allocator = std.heap.page_allocator;
+const assert = std.debug.assert;
 
 
 const AmogusData = struct {
@@ -40,26 +41,8 @@ const amogus: [18][15]u32 = .{
 };
 
 
-fn amogusNormalized() [amogus.len][amogus[0].len]f32
-{
-    var amogus_f: [amogus.len][amogus[0].len]f32 = undefined;
-    const n = @intToFloat(f32, amogus.len * amogus[0].len);
-
-    var i: usize = 0;
-    while (i < amogus.len) : (i += 1) {
-        var j: usize = 0;
-        while (j < amogus[0].len) : (j += 1) {
-            const a = @intToFloat(f32, amogus[i][j]);
-
-            amogus_f[i][j] = (a + 1.0) / n - 0.5;
-        }
-    }
-
-    return amogus_f;
-}
-
-
-inline fn processFrame(comptime S: type, comptime T: type, width: usize, height: usize, offset: f32, factor: f32, depth: u6, dither: bool, src_stride2: usize, dst_stride2: usize, srcp2: [*]const u8, dstp2: [*]u8) void
+// Unused non-vectorized function for reference
+inline fn processFrame(comptime S: type, comptime T: type, comptime dither: bool, width: usize, height: usize, offset: f32, factor: f32, depth: u6, src_stride2: usize, dst_stride2: usize, srcp2: [*]const u8, dstp2: [*]u8) void
 {
     @setFloatMode(.Optimized);  // Allows the compiler to add fused multiply-add instructions
     const amogus_f = comptime amogusNormalized();
@@ -92,19 +75,104 @@ inline fn processFrame(comptime S: type, comptime T: type, width: usize, height:
 }
 
 
-inline fn setOffsetMax(depth: u6, fullrange: bool, plane: c_int, color_family: c.VSColorFamily, offset: *f32, max: *f32) void
+inline fn processFrameVec(comptime S: type, comptime T: type, comptime dither: bool, width: usize, height: usize, offset: f32, factor: f32, depth: u6, src_stride2: usize, dst_stride2: usize, srcp2: [*]const u8, dstp2: [*]u8) void
+{
+    const amogus_f = comptime amogusNormalized();
+    // We extend the dither matrix to a width of 240 (lowest common multiple of 15 and 16)
+    // to semi-efficiently vectorize it
+    // Using a matrix with a width of 16 (like a common bayer matrix)
+    // would be much better, but this is a meme anyway
+    const amogus_padded = comptime padMatrix(amogus_f, 240);
+    comptime assert(amogus_padded[0].len == 240);
+
+    const src_stride = src_stride2 / @sizeOf(S);
+    const dst_stride = dst_stride2 / @sizeOf(T);
+    var srcp: [*]const S = @ptrCast([*]const S, @alignCast(@alignOf([*]const S), srcp2));
+    var dstp: [*]T = @ptrCast([*]T, @alignCast(@alignOf([*]T), dstp2));
+
+    const offset16 = @splat(16, offset);
+    const factor16 = @splat(16, factor);
+    const offset8 = @splat(8, offset);
+    const factor8 = @splat(8, factor);
+
+    var i: usize = 0;
+    while (i < height) : (i += 1) {
+        const dr = amogus_padded[i % amogus_padded.len];
+        var j: usize = 0;
+        // Caution: We assume that all pixel rows have an alignment of >= 32 bytes
+        //          VapourSynth guarantees this
+        while (j + 8 < ceilN(width, 8)) : (j += 16) {
+            const dr16: @Vector(16, f32) = dr[(j % 240)..][0..16].*;
+            processVecN(16, dither, offset16, factor16, depth, dr16, srcp[j..j+16], dstp[j..j+16]);
+        }
+        if (j < width) {
+            const dr8: @Vector(8, f32) = dr[(j % 240)..][0..8].*;
+            processVecN(8, dither, offset8, factor8, depth, dr8, srcp[j..j+8], dstp[j..j+8]);
+        }
+        srcp += src_stride;
+        dstp += dst_stride;
+    }
+}
+
+
+inline fn processVecN(comptime N: comptime_int, comptime dither: bool, offset: @Vector(N, f32), factor: @Vector(N, f32), depth: u6, dr: anytype, srcp: anytype, dstp: anytype) void
+{
+    @setFloatMode(.Optimized);  // Allows the compiler to add fused multiply-add instructions
+    const S = @TypeOf(srcp[0]);
+    const T = @TypeOf(dstp[0]);
+
+    const src: @Vector(N, S) = srcp[0..N].*;
+    var vec: @Vector(N, f32) = if (S != f32) undefined else src;
+    // Zig's Vector type doesn't support casting of its elements, so we do it element-wise
+    // in a loop and hope that the compiler vectorizes it away.
+    if (S != f32) {
+        var idx: usize = 0;
+        while (idx < N) : (idx += 1) {
+            vec[idx] = @intToFloat(f32, src[idx]);
+        }
+    }
+    vec = vec * factor + offset;
+
+    if (dither) {
+        vec += dr;
+    }
+
+    if (T != f32) {
+        // Round towards +inf
+        // (May not be correct for negative values,
+        //  but they get clamped anyway)
+        vec = @trunc(vec + @splat(N, @as(f32, 0.49999997)));
+
+        vec = @maximum(vec, @splat(N, @as(f32, 0.0)));
+        vec = @minimum(vec, @splat(N, @intToFloat(f32, @as(u64, 1) << depth) - 1));
+    }
+    var dst: @Vector(N, T) = if (T != f32) undefined else vec;
+    // Zig's Vector type doesn't support casting of its elements, so we do it element-wise
+    // in a loop and hope that the compiler vectorizes it away.
+    if (T != f32) {
+        var idx: usize = 0;
+        while (idx < N) : (idx += 1) {
+            dst[idx] = @floatToInt(T, vec[idx]);
+        }
+    }
+
+    dstp[0..N].* = dst;
+}
+
+
+inline fn setOffsetMax(depth: u6, fullrange: bool, plane: c_int, color_family: c.VSColorFamily, offset: *f64, max: *f64) void
 {
     if (plane != 0 and color_family != c.cfRGB) {
-        offset.* = @intToFloat(f32, @as(u64, 1) << (depth - 1));
+        offset.* = @intToFloat(f64, @as(u64, 1) << (depth - 1));
     }
-    max.* = @intToFloat(f32, (@as(u64, 1) << depth) - 1);
+    max.* = @intToFloat(f64, (@as(u64, 1) << depth) - 1);
     if (!fullrange) {
         if (plane != 0 and color_family != c.cfRGB) {
-            offset.* = @intToFloat(f32, @as(u64, 1) << (depth - 1));
-            max.* = @intToFloat(f32, @as(u64, 224) << (depth - 8));
+            offset.* = @intToFloat(f64, @as(u64, 1) << (depth - 1));
+            max.* = @intToFloat(f64, @as(u64, 224) << (depth - 8));
         } else {
-            offset.* = @intToFloat(f32, @as(u64, 16) << (depth - 8));
-            max.* = @intToFloat(f32, @as(u64, 219) << (depth - 8));
+            offset.* = @intToFloat(f64, @as(u64, 16) << (depth - 8));
+            max.* = @intToFloat(f64, @as(u64, 219) << (depth - 8));
         }
     }
 }
@@ -146,20 +214,20 @@ fn getFrame(n: c_int, activation_reason: c_int, instance_data: ?*anyopaque, fram
     while (plane < fmt.numPlanes) : (plane += 1) {
 
         const color_family = @intCast(c.VSColorFamily, fmt.colorFamily);
-        var src_offset: f32 = 0.0;
-        var src_max: f32 = 1.0;
+        var src_offset: f64 = 0.0;
+        var src_max: f64 = 1.0;
         if (d.src_depth != 32) {
             setOffsetMax(d.src_depth, src_fullrange, plane, color_family, &src_offset, &src_max);
         }
 
-        var dst_offset: f32 = 0.0;
-        var dst_max: f32 = 1.0;
+        var dst_offset: f64 = 0.0;
+        var dst_max: f64 = 1.0;
         if (d.dst_depth != 32) {
             setOffsetMax(d.dst_depth, if (d.dst_depth < 8) true else dst_fullrange, plane, color_family, &dst_offset, &dst_max);
         }
 
-        var offset = -src_offset * dst_max / src_max + dst_offset;
-        var factor = dst_max / src_max;
+        var offset = @floatCast(f32, -src_offset * dst_max / src_max + dst_offset);
+        var factor = @floatCast(f32, dst_max / src_max);
 
         const width = @intCast(usize, d.vi.width >> if (plane != 0) @intCast(u5, fmt.subSamplingW) else 0);
         const height = @intCast(usize, d.vi.height >> if (plane != 0) @intCast(u5, fmt.subSamplingH) else 0);
@@ -170,23 +238,23 @@ fn getFrame(n: c_int, activation_reason: c_int, instance_data: ?*anyopaque, fram
         const dstp = vsapi.?.getWritePtr.?(dst, plane);
 
         if (d.src_depth <= 8 and fmt.bytesPerSample == 1) {
-            processFrame(u8, u8, width, height, offset, factor, d.dst_depth, true, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(u8, u8, true, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 8 and fmt.bytesPerSample == 2) {
-            processFrame(u8, u16, width, height, offset, factor, d.dst_depth, true, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(u8, u16, true, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 8 and fmt.bytesPerSample == 4) {
-            processFrame(u8, f32, width, height, offset, factor, d.dst_depth, false, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(u8, f32, false, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 16 and fmt.bytesPerSample == 1) {
-            processFrame(u16, u8, width, height, offset, factor, d.dst_depth, true, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(u16, u8, true, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 16 and fmt.bytesPerSample == 2) {
-            processFrame(u16, u16, width, height, offset, factor, d.dst_depth, true, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(u16, u16, true, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 16 and fmt.bytesPerSample == 4) {
-            processFrame(u16, f32, width, height, offset, factor, d.dst_depth, false, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(u16, f32, false, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 32 and fmt.bytesPerSample == 1) {
-            processFrame(f32, u8, width, height, offset, factor, d.dst_depth, true, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(f32, u8, true, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 32 and fmt.bytesPerSample == 2) {
-            processFrame(f32, u16, width, height, offset, factor, d.dst_depth, true, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(f32, u16, true, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         } else if (d.src_depth <= 32 and fmt.bytesPerSample == 4) {  // Just for testing
-            processFrame(f32, f32, width, height, offset, factor, d.dst_depth, false, src_stride, dst_stride, srcp, dstp);
+            processFrameVec(f32, f32, false, width, height, offset, factor, d.dst_depth, src_stride, dst_stride, srcp, dstp);
         }
 
         // Upsample if depth is < 8 as only a depth of 8+ is supported by VapourSynth
@@ -196,10 +264,10 @@ fn getFrame(n: c_int, activation_reason: c_int, instance_data: ?*anyopaque, fram
 
             setOffsetMax(8, dst_fullrange, plane, color_family, &dst_offset, &dst_max);
 
-            offset = -src_offset * dst_max / src_max + dst_offset;
-            factor = dst_max / src_max;
+            offset = @floatCast(f32, -src_offset * dst_max / src_max + dst_offset);
+            factor = @floatCast(f32, dst_max / src_max);
 
-            processFrame(u8, u8, width, height, offset, factor, 8, false, dst_stride, dst_stride, dstp, dstp);
+            processFrameVec(u8, u8, false, width, height, offset, factor, 8, dst_stride, dst_stride, dstp, dstp);
         }
     }
 
@@ -296,6 +364,60 @@ inline fn saturateCast(comptime T: type, n: anytype) T
     }
 
     return @intCast(T, n);
+}
+
+
+fn amogusNormalized() [amogus.len][amogus[0].len]f32
+{
+    var amogus_f: [amogus.len][amogus[0].len]f32 = undefined;
+    const n = @intToFloat(f32, amogus.len * amogus[0].len);
+
+    var i: usize = 0;
+    while (i < amogus.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < amogus[0].len) : (j += 1) {
+            const a = @intToFloat(f32, amogus[i][j]);
+
+            amogus_f[i][j] = (a + 1.0) / (n + 1.0) - 0.5;
+        }
+    }
+
+    return amogus_f;
+}
+
+
+fn padMatrix(matrix: anytype, n: usize) [matrix.len][n]@TypeOf(matrix[0][0])
+{
+    @setEvalBranchQuota(10000);
+    assert(n > matrix[0].len);
+
+    var matrix_padded: [matrix.len][n]@TypeOf(matrix[0][0]) = undefined;
+    var i: usize = 0;
+    while (i < matrix.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            matrix_padded[i][j] = matrix[i][j % matrix[0].len];
+        }
+    }
+    return matrix_padded;
+}
+
+
+inline fn ceilN(x: usize, n: usize) usize
+{
+    assert(n > 0);
+    assert(n & (n - 1) == 0);  // Is power of 2
+
+    return (x + (n - 1)) & ~(n - 1);
+}
+
+
+inline fn floorN(x: usize, n: usize) usize
+{
+    assert(n > 0);
+    assert(n & (n - 1) == 0);  // Is power of 2
+
+    return x & ~(n - 1);
 }
 
 

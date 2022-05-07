@@ -13,7 +13,7 @@ Don't.
 amogus.Amogus(clip, depth[, range])
 ```
 To make the pattern obvious you can set `depth` to something lower than 8. This plugin will then scale the lower bitdepth back to 8, since VapourSynth only supports clips with a bitdepth of 8 or more.
-`range` can be used to force the output range. Input range is always derived from the frame properties.
+`range` can be used to force the output color range. Input color range is always derived from the frame properties.
 
 ## Compilation
 
